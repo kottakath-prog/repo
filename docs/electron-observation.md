@@ -109,6 +109,35 @@ The result records action status and targets, correlated app/window/WebContents,
 preload, session, navigation, shell, permission, popup, download, protocol,
 native-addon, process, and IPC timeline events. IPC channels and argument-shape
 metadata retain their observed lengths; payload values are never retained.
+Observed `ipcMain` event listeners record through a wrapper that stays the
+channel's raw-listener entry; its public `.listener` names the application's
+original callback. Removal keeps application semantics: removing by the
+original function, including through application decorators of
+`removeListener` and Node's removal traversal, receives and removes that
+function. A hook-maintained registry, not the mutable raw-listener metadata,
+owns the callback identity, so application mutation of `.listener` cannot
+defeat removal; when mutated metadata breaks the application's own native
+match, the hook completes removal by wrapper identity without rewriting public
+metadata. Completion is scoped to the removal it translates and gated by an
+O(1) native listener-count check, so ordinary removals never copy or rescan
+the listener list: completion runs only when the translated call removed no
+registration, the wrapper is still registered by identity on a re-read of the
+live list (observers that prepend during traversal cannot shield it), and the
+wrapper's data `.listener` still defeats a native match for the translated
+callback — survival with metadata that still names the callback is a decorator
+that chose not to remove, which a plain EventEmitter keeps. A wrapper
+re-registered on the same channel during its own removal is a deliberate
+restore and survives; registering it on another channel is a separate
+registration whose original-channel completion stays armed. One removal
+request removes exactly one registration. A decorator that swallows a removal
+whose metadata was already mutated away from the callback is indistinguishable
+from a forwarded native miss and is completed like one.
+Application accessors installed as entry metadata stay
+untranslated: they execute during the application's own native removal
+exactly as for a bare entry, preserving plain EventEmitter parity for
+throwing accessors. This is listener
+removal policy, not complete JavaScript introspection transparency: the
+recording wrapper itself remains visible to `rawListeners()` inspection.
 Renderer crash/restart and deep-link actions are synthetic
 scenario controls; their attempted and observed outcomes remain in the
 timeline. The active hook blocks and records external shell/navigation,

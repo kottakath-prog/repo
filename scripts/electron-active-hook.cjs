@@ -17,6 +17,9 @@ const bindBuiltinMethod = (method) =>
   applyFunction(bindFunction, callFunction, [method]);
 const forEachMapEntry = bindBuiltinMethod(Map.prototype.forEach);
 const sliceArguments = bindBuiltinMethod(Array.prototype.slice);
+const arrayLastIndexOf = bindBuiltinMethod(Array.prototype.lastIndexOf);
+const arrayPush = bindBuiltinMethod(Array.prototype.push);
+const arrayPop = bindBuiltinMethod(Array.prototype.pop);
 const weakMapHas = bindBuiltinMethod(WeakMap.prototype.has);
 const weakMapGet = bindBuiltinMethod(WeakMap.prototype.get);
 const weakMapSet = bindBuiltinMethod(WeakMap.prototype.set);
@@ -517,6 +520,11 @@ const createObservedOnceCallback = (target, channel, listener, receiver) => {
 
 const patchIpcMain = (ipcMain) => {
   if (ipcMain === null || ipcMain === undefined) return;
+  // Wrapper removals whose translated call is still running. Each flight
+  // names the channel and wrapper a removeAllListeners traversal is
+  // removing and whether that same wrapper was re-registered on that
+  // channel during the call.
+  const listenerRemovalFlights = [];
   const { handle, on, once, removeAllListeners } = ipcMain;
   let unobservedOnceScope = null;
   if (typeof handle === "function")
@@ -556,6 +564,24 @@ const patchIpcMain = (ipcMain) => {
     }
     const wrapperStatus = classifyHookListenerWrapper(listener);
     if (wrapperStatus !== "unowned") {
+      // Registering a wrapper whose translated removal is still in
+      // flight (an observer restoring a saved raw entry) adds a NEW
+      // registration, not the one being removed. Identity can no longer
+      // name the original registration, so every in-flight completion
+      // for that wrapper on the SAME channel must stand down instead of
+      // deleting the restore; registering it on another channel is a
+      // separate registration and leaves the original completion armed.
+      if (listenerRemovalFlights.length !== 0) {
+        for (
+          let index = listenerRemovalFlights.length - 1;
+          index >= 0;
+          index -= 1
+        ) {
+          const flight = listenerRemovalFlights[index];
+          if (flight.entry === listener && flight.channel === channel)
+            flight.reregistered = true;
+        }
+      }
       const result = on.call(this, channel, listener);
       if (wrapperStatus === "unknown")
         recordIpcObservationGap(channel, "listener-chain");
@@ -693,6 +719,30 @@ const patchIpcMain = (ipcMain) => {
   // including decorators installed/replaced during traversal. Application
   // getters and methods always receive the real emitter; its public methods
   // are never temporarily replaced. Native once entries remain unchanged.
+  // The registry stays authoritative when the application mutates or replaces
+  // the public `.listener` metadata: translated removal that leaves the
+  // wrapper registered (mutated metadata defeats the application's own
+  // native match) is completed by wrapper identity through the native
+  // removal captured here, scoped to the removal it translates. Completion
+  // is gated by an O(1) native listener-count check: the count not
+  // decreasing means the translated call removed no registration, so
+  // ordinary removals never copy or rescan the listener list. Only on that
+  // miss is the wrapper re-found by identity on a re-read of the live list
+  // (shift-proof when observers prepend during traversal), and only when a
+  // native removal of the translated target would still miss it — a data
+  // `.listener` that still names the target proves the application's own
+  // native call would have matched, so the wrapper's survival is a decorator
+  // that chose not to remove it, which a plain EventEmitter keeps. A wrapper
+  // re-registered on the same channel in flight is a deliberate restore and
+  // survives. One removal request removes exactly one registration, matching
+  // plain EventEmitter. Public metadata is never temporarily restored.
+  const nativeRemoveListener = ipcMain.removeListener;
+  const nativeRawListeners = ipcMain.rawListeners;
+  const nativeListenerCount = ipcMain.listenerCount;
+  const completionAvailable =
+    typeof nativeRemoveListener === "function" &&
+    typeof nativeRawListeners === "function" &&
+    typeof nativeListenerCount === "function";
   ipcMain.removeAllListeners = function patchedIpcMainRemoveAllListeners(
     ...args
   ) {
@@ -716,14 +766,62 @@ const patchIpcMain = (ipcMain) => {
                 hookListenerRemovalTargets,
                 entry,
               );
-              // Translate only a still-valid data link. If app code changed it
-              // to an accessor, native removal owns when that getter executes.
+              // Translate by registry identity whenever the data link is a
+              // data property, whatever value mutation left on it. Accessor
+              // metadata stays untranslated: the application's own native
+              // removal owns when that getter executes, preserving plain
+              // EventEmitter parity for throwing accessors.
               if (
                 removalTarget !== undefined &&
                 removalTarget !== entry &&
-                listenerDataDescriptor(entry)?.value === removalTarget
-              )
+                listenerDataDescriptor(entry) != null
+              ) {
+                const channel = methodArgs[0];
+                // O(1) miss gate, captured before the call: the translated
+                // native match removes the last matching registration, so a
+                // decreased count means this request already removed one
+                // (its own or an earlier sibling's) and completing now would
+                // remove a second one for a single removal request. No
+                // listener-list copy happens on this ordinary path.
+                const countBefore = completionAvailable
+                  ? nativeListenerCount.call(emitter, channel)
+                  : -1;
+                const flight = { entry, channel, reregistered: false };
+                arrayPush(listenerRemovalFlights, flight);
                 methodArgs[1] = removalTarget;
+                let result;
+                try {
+                  result = applyFunction(value, emitter, methodArgs);
+                } finally {
+                  arrayPop(listenerRemovalFlights);
+                }
+                // Mutated metadata defeats the application's own native
+                // match; complete the removal only when the translated call
+                // removed nothing (count did not decrease), no observer
+                // re-registered this wrapper on this channel during the
+                // call, metadata still defeats a native match for the
+                // translated target (survival with matching metadata is a
+                // decorator that chose not to remove, which plain keeps),
+                // and the wrapper is still registered by identity on the
+                // live list (shift-proof under prepends).
+                if (
+                  completionAvailable &&
+                  nativeListenerCount.call(emitter, channel) >= countBefore &&
+                  !flight.reregistered
+                ) {
+                  const metadata = listenerDataDescriptor(entry);
+                  if (
+                    metadata != null &&
+                    metadata.value !== removalTarget &&
+                    arrayLastIndexOf(
+                      nativeRawListeners.call(emitter, channel),
+                      entry,
+                    ) >= 0
+                  )
+                    nativeRemoveListener.call(emitter, channel, entry);
+                }
+                return result;
+              }
             }
             return applyFunction(value, emitter, methodArgs);
           };
